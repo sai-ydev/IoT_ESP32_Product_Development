@@ -1,15 +1,11 @@
-import sys
-from micropython import const
 import asyncio
 import aioble
 import bluetooth
-import random
-import struct
+import ustruct
 import network
 import utime
-import secrets
+import creds
 import urequests
-import machine
 
 # org.bluetooth.service.fitness_machine
 _FIT_MACHINE_UUID = bluetooth.UUID(0x1826)
@@ -22,61 +18,57 @@ parameters = {
     "Content-Type" : "application/json",
 }
 
-wlan = network.WLAN(network.STA_IF)
-wlan.active(True)
-print(wlan.scan())
-wlan.connect(secrets.SSID, secrets.PASSWORD)
+wifi = network.WLAN(network.STA_IF)
+wifi.active(True)
+print(wifi.scan())
+wifi.connect(creds.SSID, creds.PASSWORD)
 
-while not wlan.isconnected():
+while not wifi.isconnected():
     print(".")
     utime.sleep(1)
     
-print(f"Success! Connected to {secrets.SSID}")
-network_params = wlan.ifconfig()
+print(f"Success! Connected to {creds.SSID}")
+network_params = wifi.ifconfig()
 print(f"IP address is {network_params[0]}")
 
-# Helper to decode the step count.
-def _decode_step_count(data):
-    return struct.unpack("<h", data)[0]
+def parse_step_count(data):
+    return ustruct.unpack("<h", data)[0]
 
 
-async def find_step_sensor():
-    # Scan for 5 seconds, in active mode, with very low interval/window (to
-    # maximise detection rate).
+async def connect_step_counter():
     async with aioble.scan(5000, interval_us=30000, window_us=30000, active=True) as scanner:
-        async for result in scanner:
+        async for scan_device in scanner:
             # See if it matches our name and the fitnesss machine service.
-            if result.name() == "step-counter" and _FIT_MACHINE_UUID in result.services():
-                return result.device
+            if scan_device.name() == "step-counter" and _FIT_MACHINE_UUID in scan_device.services():
+                return scan_device.device
     return None
 
 
 async def bluetooth_client_task():
-    device = await find_step_sensor()
-    if not device:
+    pedometer = await connect_step_counter()
+    if pedometer is None:
         print("Step Counter not found")
         return
 
     try:
-        print("Connecting to", device)
-        connection = await device.connect()
-    except asyncio.TimeoutError:
+        connection = await pedometer.connect()
+    except Exception:
         print("Timeout during connection")
         return
 
     async with connection:
         try:
             fitness_service = await connection.service(_FIT_MACHINE_UUID)
-            step_count_characteristic = await fitness_service.characteristic(_STEP_COUNTER_UUID)
+            step_count_rx = await fitness_service.characteristic(_STEP_COUNTER_UUID)
         except asyncio.TimeoutError:
             print("Timeout discovering services/characteristics")
             return
 
         while connection.is_connected():
-            step_count = _decode_step_count(await step_count_characteristic.read())
+            step_count = parse_step_count(await step_count_rx.read())
             print("Step Count: {0}".format(step_count))
             post_data(IO_FEED_ID, str(step_count))
-            await machine.deepsleep(10000)
+            await asyncio.sleep_ms(10000)
             
 def post_data(feed_id, data):
     url = 'https://io.adafruit.com/api/v2/webhooks/feed/'

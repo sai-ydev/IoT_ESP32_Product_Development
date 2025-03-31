@@ -1,64 +1,92 @@
-
 import bluetooth
-import aioble
-import asyncio
-import struct
-import time
-from ble_advertising import advertising_payload
-from machine import I2C
-from lsm6ds3 import LSM6DS3, NORMAL_MODE_104HZ
+from ble_advertising import advertising_payload # used from micropython repo
 from micropython import const
+import machine
+import lsm6ds3
+import ustruct
+import utime
+
+# ble connection states
+central_connect = const(1)
+central_disconnect = const(2)
+indicate_done = const(20)
+
+# flags
+read_flag = const(0x0002)
+notify_flag = const(0x0010)
+indicate_flag = const(0x0020)
 
 # org.bluetooth.service.fitness_machine
-_FIT_SENSE_UUID = bluetooth.UUID(0x1826)
+pedometer_uuid = bluetooth.UUID(0x1826)
 # org.bluetooth.characteristic.step_counter_activity.summary
-_FIT_CHAR = bluetooth.UUID(0x2B40)
+pedometer_characteristic = (
+    bluetooth.UUID(0x2B40),
+    read_flag | notify_flag | indicate_flag,
+)
+pedometer_service = (
+    pedometer_uuid,
+    (pedometer_characteristic,),
+)
 
 # org.bluetooth.characteristic.gap.appearance.xml
-_ADV_APPEARANCE_WALKING_SENSOR = const(1091)
+pedometer_appearance = const(1091)
 
-# How frequently to send advertising beacons.
-_ADV_INTERVAL_MS = 250_000
+i2c = machine.I2C(1, scl=48, sda=47, freq=400000)
+pedometer = lsm6ds3.LSM6DS3(i2c, mode=lsm6ds3.NORMAL_MODE_104HZ)
 
-i2c = I2C(1, scl=48, sda=47, freq=400000)
-lsm6ds3 = LSM6DS3(i2c, mode=NORMAL_MODE_104HZ)
+pedometer.reset_step_count()
 
-lsm6ds3.reset_step_count()
+class ESP32Pedometer:
+    def __init__(self, ble_connection, name="step-counter"):
+        self.ble_conn = ble_connection
+        self.ble_conn.active(True)
+        self.ble_conn.irq(self.irq_handler)
+        ((self.handle,),) = self.ble_conn.gatts_register_services((pedometer_service,))
+        self.connections = set()
+        self.payload = advertising_payload(
+            name=name, services=[pedometer_uuid], appearance=pedometer_appearance
+        )
+        self.advertise()
 
-# Register GATT server.
-fitness_service = aioble.Service(_FIT_SENSE_UUID)
-step_count_characteristic = aioble.Characteristic(
-    fitness_service, _FIT_CHAR, read=True, notify=True
-)
-aioble.register_services(fitness_service)
-
-def _encode_step_count(step_count):
-    return struct.pack("<h", step_count)
-
-# This would be periodically polling a hardware sensor.
-async def sensor_task():
-    while True:
-        steps = lsm6ds3.get_step_count()
-        print("Steps: {}".format(steps))
-        step_count_characteristic.write(_encode_step_count(steps), send_update=True)
-        await asyncio.sleep_ms(1000)
+    def irq_handler(self, event, data):
         
-async def peripheral_task():
-    while True:
-        async with await aioble.advertise(
-            _ADV_INTERVAL_MS,
-            name="step-counter",
-            services=[_FIT_SENSE_UUID],
-            appearance=_ADV_APPEARANCE_WALKING_SENSOR,
-        ) as connection:
-            print("Connection from", connection.device)
-            await connection.disconnected(timeout_ms=None)
+        if event == central_connect:
+            conn_handle, _, _ = data
+            self.connections.add(conn_handle)
+        elif event == central_disconnect:
+            conn_handle, _, _ = data
+            self.connections.remove(conn_handle)
+            self.advertise()
+        elif event == indicate_done:
+            conn_handle, value_handle, status = data
 
-def pedometer_demo():
-    t1 = asyncio.create_task(sensor_task())
-    t2 = asyncio.create_task(peripheral_task())
-    await asyncio.gather(t1, t2)
+    def set_step_count(self, step_count, notify=False, indicate=False):
+        self.ble_conn.gatts_write(self.handle, ustruct.pack("<h", step_count))
+        if notify or indicate:
+            for conn_handle in self.connections:
+                if notify:
+                    self.ble_conn.gatts_notify(conn_handle, self.handle)
+                if indicate:
+                    self.ble_conn.gatts_indicate(conn_handle, self._handle)
+
+    def advertise(self, interval_us=500000):
+        # advertise with 500ms interval
+        self.ble_conn.gap_advertise(interval_us, adv_data=self.payload)
+
+
+def demo():
+    ble = bluetooth.BLE()
+    step_counter = ESP32Pedometer(ble)
+
+    i = 0
+
+    while True:
+        i = (i + 1) % 10
+        steps = pedometer.get_step_count()
+        print("Steps: {}".format(steps))
+        step_counter.set_step_count(steps, notify=(i == 0), indicate=False)
+        utime.sleep_ms(1000)
 
 
 if __name__ == "__main__":
-    asyncio.run(pedometer_demo())
+    demo()
